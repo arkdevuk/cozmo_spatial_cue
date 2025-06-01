@@ -82,10 +82,12 @@ def visual_cue_handler():
 
         ret, frame = stream.read()
         if not ret or frame is None:
-            print("Camera disconnected or no frame.")
+            Logger.error("[YOLO] Camera disconnected or no frame.")
             break
 
-        results = model.track(frame, conf=0.65, persist=True, tracker="bytetrack.yaml")
+        results = model.track(frame, conf=0.65, persist=True,
+                              verbose=False,
+                              tracker="bytetrack.yaml")
         main_cozmo_detected = False
 
         for r in results:
