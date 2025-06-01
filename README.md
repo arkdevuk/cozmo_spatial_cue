@@ -5,7 +5,7 @@ Detects and tracks your robot with your webcam, sends live annotated images, and
 
 ---
 
-[image_webcam]
+![annotated image](https://github.com/arkdevuk/cozmo_spatial_cue/raw/master/Doc/images/cozmo_found.jpeg)
 
 ---
 
@@ -35,7 +35,7 @@ Detects and tracks your robot with your webcam, sends live annotated images, and
 
 ---
 
-[MQTT EVENTS LOGS]
+![logs](https://github.com/arkdevuk/cozmo_spatial_cue/raw/master/Doc/images/logs.png)
 
 ---
 
