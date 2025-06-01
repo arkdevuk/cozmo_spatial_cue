@@ -44,12 +44,39 @@ def init_broker():
     mqtt_client.start()
     mqtt_client.wait_for_broker_ready(timeout=10)
 
+def publish_annotated_image(img, topic="cozmo/camera_top/annotated"):
+    img_bytes = cv2.imencode('.jpg', img)[1].tobytes()
+    now = str(time.time())
+    object_to_publish = {
+        "stamp": now,
+        "image": base64.b64encode(img_bytes).decode('utf-8')
+    }
+    mqtt_client.publish(topic, json.dumps(object_to_publish))
+
+def publish_motion_event(is_moving, topic="cozmo/camera_top/motion"):
+    event = {
+        "state": is_moving,
+        "stamp": str(time.time()),
+    }
+    mqtt_client.publish(topic, json.dumps(event))
+
+def publish_robot_event(event_type, topic="cozmo/camera_top/events"):
+    event = {
+        "type": event_type,
+        "stamp": str(time.time()),
+    }
+    mqtt_client.publish(topic, json.dumps(event))
+
 previous_position = None
 previous_state = None
 state_history = []
 
+cozmo_found = False
+missing_counter = 0
+
 def visual_cue_handler():
     global previous_position, previous_state, state_history
+    global cozmo_found, missing_counter
     while True:
         start_time = time.time()
 
@@ -59,6 +86,7 @@ def visual_cue_handler():
             break
 
         results = model.track(frame, conf=0.65, persist=True, tracker="bytetrack.yaml")
+        main_cozmo_detected = False
 
         for r in results:
             detected_objects = []
@@ -81,7 +109,10 @@ def visual_cue_handler():
             Logger.debug(f"[YOLO] Detections: {json.dumps(detected_objects)}")
 
             if detected_objects:
+                # --- COZMO DETECTION FOUND ---
                 main_cozmo = max(detected_objects, key=lambda x: x['confidence'])
+                main_cozmo_detected = True
+
                 x1 = main_cozmo["bbox"]["x1"]
                 y1 = main_cozmo["bbox"]["y1"]
                 x2 = main_cozmo["bbox"]["x2"]
@@ -90,7 +121,7 @@ def visual_cue_handler():
                 center_y = (y1 + y2) // 2
                 current_coordinates = {"x": center_x, "y": center_y}
 
-                # Movement check (threshold=4)
+                # Movement check (threshold=2)
                 move_threshold = 2
                 if previous_position is not None:
                     dx = current_coordinates["x"] - previous_position["x"]
@@ -108,28 +139,32 @@ def visual_cue_handler():
                     state_history.pop(0)
 
                 # Only trigger state change if last 2 frames agree and state is different
-                # if (
-                #     len(state_history) == 2
-                #     and state_history[0] == state_history[1]
-                #     and state_history[1] != previous_state
-                # ):
                 if previous_state is not is_moving:
                     Logger.info(f"[YOLO] Coordinates: {json.dumps(current_coordinates)}, Moving: {is_moving}")
-                    movement_event = {
-                        "state": is_moving,
-                        "stamp": str(time.time()),
-                    }
-                    mqtt_client.publish("cozmo/camera_top/motion", json.dumps(movement_event))
+                    publish_motion_event(is_moving)
                     previous_state = is_moving
 
-            # Publish the frame to the MQTT broker
-            img_bytes = cv2.imencode('.jpg', r.plot())[1].tobytes()
-            now = str(time.time())
-            object_to_publish = {
-                "stamp": now,
-                "image": base64.b64encode(img_bytes).decode('utf-8')
-            }
-            mqtt_client.publish("cozmo/camera_top/annotated", json.dumps(object_to_publish))
+            # Publish the annotated image using helper
+            publish_annotated_image(r.plot())
+
+        # --- COZMO FOUND/LOST LOGIC ---
+        if main_cozmo_detected:
+            if not cozmo_found:
+                cozmo_found = True
+                missing_counter = 0
+                publish_robot_event("robot_found")
+                Logger.info("[YOLO] Robot found, published robot_found event")
+            else:
+                missing_counter = 0  # reset
+        else:
+            if cozmo_found:
+                missing_counter += 1
+                if missing_counter >= fps_limit:
+                    cozmo_found = False
+                    publish_robot_event("robot_lost")
+                    Logger.info("[YOLO] Robot lost, published robot_lost event")
+            else:
+                missing_counter = 0  # stays zero
 
         elapsed = time.time() - start_time
         if elapsed < frame_time:
