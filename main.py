@@ -1,13 +1,12 @@
 import base64
 import json
 import os
-import queue
 import time
 
-from ultralytics import YOLO, YOLOE, YOLOWorld
+import torch
+from ultralytics import YOLO
 
 import cv2
-import numpy as np
 from dotenv import load_dotenv, find_dotenv
 import threading
 
@@ -22,13 +21,17 @@ load_dotenv(dotenv_path=find_dotenv(".env"), override=False)
 local_env = find_dotenv(".env.local")
 if local_env:
     load_dotenv(dotenv_path=local_env, override=True)
+
 # --- Initialize YOLO model ---
 model = YOLO("./models/yolov11_cozmo.pt")
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model.to(device)
+Logger.info(f"[YOLO] Model loaded on {device}")
 
 # Start threaded camera stream
 stream = CameraStream(0)
 
-fps_limit = 4  # Or whatever you want
+fps_limit = 12
 frame_time = 1.0 / fps_limit
 
 def init_broker():
@@ -42,29 +45,28 @@ def init_broker():
     mqtt_client.wait_for_broker_ready(timeout=10)
 
 previous_position = None
+previous_state = None
+state_history = []
 
 def visual_cue_handler():
+    global previous_position, previous_state, state_history
     while True:
         start_time = time.time()
 
-        # Always grab the latest frame from the thread
         ret, frame = stream.read()
         if not ret or frame is None:
             print("Camera disconnected or no frame.")
             break
 
-        # Run YOLO tracking on the newest frame
         results = model.track(frame, conf=0.65, persist=True, tracker="bytetrack.yaml")
 
         for r in results:
             detected_objects = []
             for box in r.boxes:
-                # use box.id for tracking ID if available to str
                 cls_id = int(box.cls)
                 conf = float(box.conf)
                 label = model.names[cls_id]
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
-
                 detected_objects.append({
                     "label": label,
                     "confidence": round(conf, 3),
@@ -78,50 +80,64 @@ def visual_cue_handler():
 
             Logger.debug(f"[YOLO] Detections: {json.dumps(detected_objects)}")
 
-            # main cozmo : get the detection with the highest confidence
-            main_cozmo = None
             if detected_objects:
                 main_cozmo = max(detected_objects, key=lambda x: x['confidence'])
-                # get center of the bounding box
-                x1, y1, x2, y2 = main_cozmo['bbox'].values()
+                x1 = main_cozmo["bbox"]["x1"]
+                y1 = main_cozmo["bbox"]["y1"]
+                x2 = main_cozmo["bbox"]["x2"]
+                y2 = main_cozmo["bbox"]["y2"]
                 center_x = (x1 + x2) // 2
                 center_y = (y1 + y2) // 2
-                # set coordinates for the main cozmo relative to the frame 640x480
-                current_coordinates = {
-                    "x": center_x / 640.0,
-                    "y": center_y / 480.0
-                }
-                # todo check if moving or not, smooth with kalman filter
-                # it need to be precise enought so that cozmo is able to know if he is stuck or not
-                # <CODE AFTER>
+                current_coordinates = {"x": center_x, "y": center_y}
 
-                # <CODE BEFORE>
-                Logger.info(f"[YOLO] Coordinates: {json.dumps(current_coordinates)}")
+                # Movement check (threshold=4)
+                move_threshold = 2
+                if previous_position is not None:
+                    dx = current_coordinates["x"] - previous_position["x"]
+                    dy = current_coordinates["y"] - previous_position["y"]
+                    dist = (dx ** 2 + dy ** 2) ** 0.5
+                    is_moving = dist > move_threshold
+                else:
+                    is_moving = True  # First frame, assume moving
+
                 previous_position = current_coordinates
 
+                # State smoothing: require 2 consecutive frames to trigger state change
+                state_history.append(is_moving)
+                if len(state_history) > 2:
+                    state_history.pop(0)
+
+                # Only trigger state change if last 2 frames agree and state is different
+                # if (
+                #     len(state_history) == 2
+                #     and state_history[0] == state_history[1]
+                #     and state_history[1] != previous_state
+                # ):
+                if previous_state is not is_moving:
+                    Logger.info(f"[YOLO] Coordinates: {json.dumps(current_coordinates)}, Moving: {is_moving}")
+                    movement_event = {
+                        "state": is_moving,
+                        "stamp": str(time.time()),
+                    }
+                    mqtt_client.publish("cozmo/camera_top/motion", json.dumps(movement_event))
+                    previous_state = is_moving
 
             # Publish the frame to the MQTT broker
-            img_bytes =  cv2.imencode('.jpg', r.plot())[1].tobytes()
-            # publish the image to a different topic
-            now = time.time().__str__()
-            # image is base64 encoded
+            img_bytes = cv2.imencode('.jpg', r.plot())[1].tobytes()
+            now = str(time.time())
             object_to_publish = {
                 "stamp": now,
                 "image": base64.b64encode(img_bytes).decode('utf-8')
             }
             mqtt_client.publish("cozmo/camera_top/annotated", json.dumps(object_to_publish))
 
-        # Time control to limit FPS
         elapsed = time.time() - start_time
         if elapsed < frame_time:
             time.sleep(frame_time - elapsed)
 
-
-# Press the green button in the gutter to run the script.
 if __name__ == '__main__':
     init_broker()
     Logger.info("[Main] Starting visual cue service...")
-    # start thread to handle visual cues
     threading.Thread(target=visual_cue_handler, daemon=True).start()
 
     try:
@@ -130,5 +146,4 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         Logger.info("[Main] Shutting down")
         mqtt_client.stop()
-        # end of while loop, stop the stream
         stream.stop()
